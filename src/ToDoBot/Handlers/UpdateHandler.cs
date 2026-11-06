@@ -204,12 +204,14 @@ public sealed class UpdateHandler(ITelegramBotClient bot, IToDoService tasks, IT
                 case "canceldelete":
                     var parts = query.Data.Split('|');
                     if (parts.Length != 2 || !_deletions.TryGetValue(key, out var pending) ||
-                        pending.MessageId != id || parts[1] != pending.Nonce ||
+                        pending.MessageId != id ||
                         DateTimeOffset.UtcNow - pending.CreatedAt > TimeSpan.FromMinutes(10))
                     {
                         await Edit(chat, id, "Подтверждение устарело. Откройте задачу или список заново через /show.", Menu(), ct);
                         break;
                     }
+                    // A mismatching token must not replace a still-valid confirmation screen.
+                    if (parts[1] != pending.Nonce) break;
                     if (!_deletions.TryRemove(key, out _)) break;
                     var result = await pending.Scenario.Handle(pending.Context,
                         action == "confirmdelete" ? ScenarioInput.Confirm : ScenarioInput.Cancel, ct);
@@ -226,7 +228,9 @@ public sealed class UpdateHandler(ITelegramBotClient bot, IToDoService tasks, IT
 
     private async Task ShowLists(long chat, long user, int? messageId, int page, bool select, CancellationToken ct)
     {
-        if (select && (!_drafts.TryGetValue((chat, user), out var active) || active.Stage != DraftStage.List))
+        if (select && (!_drafts.TryGetValue((chat, user), out var active) ||
+                       active.Stage != DraftStage.List ||
+                       (messageId.HasValue && active.MessageId != messageId.Value)))
         {
             if (messageId is { } stale) await Edit(chat, stale, "Начните добавление заново: /addtask.", Menu(), ct);
             return;
@@ -290,8 +294,11 @@ public sealed class UpdateHandler(ITelegramBotClient bot, IToDoService tasks, IT
         rows.Add([InlineKeyboardButton.WithCallbackData("❌Удалить", new ToDoItemCallbackDto("deletetask", task.Id).ToString())]);
         rows.Add([InlineKeyboardButton.WithCallbackData("К задачам", back.ToString())]);
         var due = task.DueDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "не указан";
+        var completion = task.CompletedAt is { } completedAt
+            ? $"\nВремя выполнения: {completedAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC"
+            : string.Empty;
         await Edit(chat, messageId,
-            $"{task.Name}\n\nСтатус: {(task.IsCompleted ? "Выполнена" : "Активна")}\nСрок выполнения: {due}\nСоздана: {task.CreatedAt.UtcDateTime:yyyy-MM-dd HH:mm} UTC",
+            $"{task.Name}\n\nСтатус: {(task.IsCompleted ? "Выполнена" : "Активна")}\nСрок выполнения: {due}\nСоздана: {task.CreatedAt.UtcDateTime:yyyy-MM-dd HH:mm} UTC{completion}",
             new InlineKeyboardMarkup(rows), ct);
     }
 
@@ -328,7 +335,7 @@ public sealed class UpdateHandler(ITelegramBotClient bot, IToDoService tasks, IT
         [
             [InlineKeyboardButton.WithCallbackData("Да, удалить", $"confirmdelete|{nonce}")],
             [InlineKeyboardButton.WithCallbackData("Отмена", $"canceldelete|{nonce}")]
-        ]), ct);
+        ]), ct, preserveConfirmation: true);
     }
 
     private async Task<ToDoItem?> OwnedTask(long user, Guid id, CancellationToken ct)
@@ -346,8 +353,13 @@ public sealed class UpdateHandler(ITelegramBotClient bot, IToDoService tasks, IT
     private static int ClampPage(int page, int count) => Math.Clamp(page, 0, count == 0 ? 0 : (count - 1) / _pageSize);
     private async Task Send(long chat, string text, CancellationToken ct) => await bot.SendMessage(chat, text, cancellationToken: ct);
 
-    private async Task Edit(long chat, int messageId, string text, InlineKeyboardMarkup? markup, CancellationToken ct)
+    private async Task Edit(long chat, int messageId, string text, InlineKeyboardMarkup? markup, CancellationToken ct,
+        bool preserveConfirmation = false)
     {
+        // Only private chats reach this method, so the chat ID also identifies the user.
+        var key = (chat, chat);
+        if (!preserveConfirmation && _deletions.TryGetValue(key, out var pending) && pending.MessageId == messageId)
+            _deletions.TryRemove(key, out _);
         try { await bot.EditMessageText(chat, messageId, text, replyMarkup: markup, cancellationToken: ct); }
         catch (ApiRequestException ex) when (ex.ErrorCode == 400 && ex.Message.Contains("message is not modified", StringComparison.OrdinalIgnoreCase)) { }
     }

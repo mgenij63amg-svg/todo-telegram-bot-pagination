@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using Telegram.Bot;
 using Telegram.Bot.Types;
@@ -59,6 +60,7 @@ public sealed class UpdateHandlerTests : IDisposable
 
     [Theory]
     [InlineData("/completetask")]
+    [InlineData("/removetask")]
     [InlineData("/deletetask")]
     [InlineData("/complete")]
     [InlineData("/delete")]
@@ -98,6 +100,59 @@ public sealed class UpdateHandlerTests : IDisposable
         Assert.Empty(Requests("sendMessage"));
         Assert.All(Requests("editMessageText"), request =>
             Assert.Equal(MenuMessageId, request.Body.GetProperty("message_id").GetInt32()));
+    }
+
+    [Theory]
+    [InlineData(0, false, 1)]
+    [InlineData(1, false, 1)]
+    [InlineData(5, false, 1)]
+    [InlineData(6, false, 2)]
+    [InlineData(10, false, 2)]
+    [InlineData(11, false, 3)]
+    [InlineData(0, true, 1)]
+    [InlineData(1, true, 1)]
+    [InlineData(5, true, 1)]
+    [InlineData(6, true, 2)]
+    [InlineData(10, true, 2)]
+    [InlineData(11, true, 3)]
+    public async Task ActiveAndCompletedPageBoundariesHaveFiveButtonsAndCorrectArrows(
+        int count, bool completed, int expectedPages)
+    {
+        var (list, matchingTasks) = await SeedTasks(count, completed);
+        var opposite = await _tasks.Add(Owner, list.Id, "Другая группа статуса", null, CancellationToken.None);
+        if (!completed)
+            await _tasks.Complete(Owner, opposite.Id, CancellationToken.None);
+        var action = completed ? "show_completed" : "show";
+
+        for (var page = 0; page < expectedPages; page++)
+        {
+            await Callback(new PagedListCallbackDto(action, list.Id, page).ToString());
+
+            if (count == 0)
+            {
+                Assert.Equal("Задач нет", LastEdit.Text);
+                Assert.Empty(TaskButtons(LastEdit));
+            }
+            else
+            {
+                AssertPage(LastEdit, matchingTasks.Skip(page * 5).Take(5),
+                    $"Страница {page + 1} из {expectedPages}");
+            }
+            Assert.DoesNotContain(TaskButtons(LastEdit), button => button.Text == opposite.Name);
+            Assert.Equal(MenuMessageId, LastEdit.Body.GetProperty("message_id").GetInt32());
+            if (page == 0)
+                Assert.Null(Arrow(LastEdit, "⬅️"));
+            else
+                Assert.Equal(new PagedListCallbackDto(action, list.Id, page - 1).ToString(), Arrow(LastEdit, "⬅️")!.Data);
+            if (page == expectedPages - 1)
+                Assert.Null(Arrow(LastEdit, "➡️"));
+            else
+                Assert.Equal(new PagedListCallbackDto(action, list.Id, page + 1).ToString(), Arrow(LastEdit, "➡️")!.Data);
+        }
+
+        Assert.Equal(expectedPages, Requests("answerCallbackQuery").Count);
+        Assert.Equal(expectedPages, Requests("editMessageText").Count);
+        Assert.Empty(Requests("sendMessage"));
     }
 
     [Fact]
@@ -221,6 +276,28 @@ public sealed class UpdateHandlerTests : IDisposable
     }
 
     [Fact]
+    public async Task CompletedTaskCardShowsItsCompletionTimestampInUtcAndCannotBeCompletedAgain()
+    {
+        var task = await _tasks.Add(Owner, null, "Выполненная с датой", null, CancellationToken.None);
+        await _tasks.Complete(Owner, task.Id, CancellationToken.None);
+        var filePath = Path.Combine(_directory, "todos.json");
+        var data = JsonNode.Parse(await System.IO.File.ReadAllTextAsync(filePath))!;
+        var savedItem = Assert.Single(data["items"]!.AsArray())!;
+        savedItem["createdAt"] = "2024-01-01T00:00:00+00:00";
+        savedItem["completedAt"] = "2024-04-02T13:45:59+07:00";
+        await System.IO.File.WriteAllTextAsync(filePath, data.ToJsonString());
+        var completedAt = new DateTimeOffset(2024, 4, 2, 13, 45, 59, TimeSpan.FromHours(7));
+
+        await Callback(new ToDoItemCallbackDto("showtask", task.Id).ToString());
+
+        Assert.Contains($"Время выполнения: {completedAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC", LastEdit.Text);
+        Assert.Contains("Статус: Выполнена", LastEdit.Text);
+        Assert.DoesNotContain(LastEdit.Buttons, button => button.Data.StartsWith("completetask|", StringComparison.Ordinal));
+        Assert.Equal(new PagedListCallbackDto("show_completed", Guid.Empty, 0).ToString(), Button(LastEdit, "К задачам").Data);
+        Assert.Empty(Requests("sendMessage"));
+    }
+
+    [Fact]
     public async Task DeleteRequiresConfirmationCancelAndConfirmationTokensCannotBeReplayed()
     {
         var task = await _tasks.Add(Owner, null, "Сначала спросить", null, CancellationToken.None);
@@ -259,9 +336,12 @@ public sealed class UpdateHandlerTests : IDisposable
         var task = await _tasks.Add(Owner, null, "Не удалить чужим нажатием", null, CancellationToken.None);
         await Callback(new ToDoItemCallbackDto("deletetask", task.Id).ToString());
         var confirmation = Button(LastEdit, "Да, удалить").Data;
+        var editsBeforeWrongNonce = Requests("editMessageText").Count;
 
         await Callback("confirmdelete|" + new string('0', 32));
-        Assert.Contains("устарело", LastEdit.Text);
+        Assert.Equal(editsBeforeWrongNonce, Requests("editMessageText").Count);
+        Assert.Contains("Удалить задачу", LastEdit.Text);
+        Assert.Equal(confirmation, Button(LastEdit, "Да, удалить").Data);
         Assert.NotNull(await _tasks.Get(task.Id, CancellationToken.None));
         await Callback(confirmation, messageId: MenuMessageId + 1);
         Assert.Contains("устарело", LastEdit.Text);
@@ -276,6 +356,24 @@ public sealed class UpdateHandlerTests : IDisposable
 
         await Callback(confirmation);
         Assert.Null(await _tasks.Get(task.Id, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ConfirmFromScreenReplacedByNavigationIsRejected()
+    {
+        var first = await _tasks.Add(Owner, null, "Задача A", null, CancellationToken.None);
+        var second = await _tasks.Add(Owner, null, "Задача B", null, CancellationToken.None);
+        await Callback(new ToDoItemCallbackDto("deletetask", first.Id).ToString());
+        var staleConfirmation = Button(LastEdit, "Да, удалить").Data;
+        await Callback(new ToDoItemCallbackDto("showtask", second.Id).ToString());
+        Assert.Contains(second.Name, LastEdit.Text);
+        Assert.DoesNotContain(LastEdit.Buttons, button => button.Data.StartsWith("confirmdelete|", StringComparison.Ordinal));
+
+        await Callback(staleConfirmation);
+
+        Assert.Equal(first, await _tasks.Get(first.Id, CancellationToken.None));
+        Assert.Equal(second, await _tasks.Get(second.Id, CancellationToken.None));
+        Assert.Contains("устарело", LastEdit.Text);
     }
 
     [Fact]
@@ -473,6 +571,34 @@ public sealed class UpdateHandlerTests : IDisposable
         await Message("/cancel");
         await Message("2030-06-30");
         Assert.Empty(await _tasks.GetAll(Owner, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task OldPickerPageCannotHijackANewTaskCreationDialogAfterCancellation()
+    {
+        var selectedList = await _lists.Add(Owner, "Список нового диалога", CancellationToken.None);
+        for (var index = 1; index <= 5; index++)
+            await _lists.Add(Owner, $"Дополнительный список {index}", CancellationToken.None);
+        await Message("/addtask");
+        var oldMessageId = _transport.LastSentMessageId;
+        var oldPageCallback = Arrow(LastSend, "➡️")!.Data;
+        Assert.Equal("picklists", PagedListCallbackDto.FromString(oldPageCallback).Action);
+        await Message("/cancel");
+        await Message("/addtask");
+        var currentMessageId = _transport.LastSentMessageId;
+        var currentListCallback = Button(LastSend, selectedList.Name).Data;
+        Assert.NotEqual(oldMessageId, currentMessageId);
+
+        await Callback(oldPageCallback, messageId: oldMessageId);
+        await Callback(currentListCallback, messageId: currentMessageId);
+
+        Assert.Contains("Введите название задачи", LastEdit.Text);
+        Assert.Equal(currentMessageId, LastEdit.Body.GetProperty("message_id").GetInt32());
+        await Message("Задача из нового диалога");
+        await Message("-");
+        var saved = Assert.Single(await _tasks.GetAll(Owner, CancellationToken.None));
+        Assert.Equal(selectedList.Id, saved.ToDoListId);
+        Assert.Equal("Задача из нового диалога", saved.Name);
     }
 
     [Fact]
